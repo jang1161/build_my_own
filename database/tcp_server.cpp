@@ -15,7 +15,7 @@
 #include <vector>
 using namespace std;
 
-const size_t K_MAX_MSG = 4096;
+const size_t K_MAX_MSG = 32 << 20;
 
 struct Conn {
     int fd = -1;
@@ -34,6 +34,49 @@ static void die(const char *msg) {
     int err = errno;
     fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
+}
+
+static void buf_append(vector<uint8_t> &buf, const uint8_t *data, size_t len) {
+    buf.insert(buf.end(), data, data + len);
+}
+
+static void buf_consume(vector<uint8_t> &buf, size_t n) {
+    buf.erase(buf.begin(), buf.begin() + n);
+}
+
+// Request if there is enough data
+static bool try_one_request(Conn *conn) {
+    // Try to parse the accumulated buffer
+    if(conn->incoming.size() < 4) {
+        return false; // want read more
+    }
+
+    // Protocol: message header
+    uint32_t len = 0;
+    memcpy(&len, conn->incoming.data(), 4);
+    if(len > K_MAX_MSG) {
+        msg("too long");
+        conn->want_close = true;
+        return false; // want close
+    }
+
+    // Protocol: message body
+    if(4 + len > conn->incoming.size()) {
+        return false; // want read more
+    }
+    const uint8_t *request = &conn->incoming[4];
+
+    // Got one request, do something
+    printf("client says: len: %d, data: %.*s\n",
+    len, len < 100 ? len : 100, request);
+
+    // Generate the response (echo)
+    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
+    buf_append(conn->outgoing, request, len);
+
+    // Remove the message from incoming
+    buf_consume(conn->incoming, 4 + len);
+    return true;
 }
 
 static int32_t read_full(int fd, char *buf, size_t n) {
@@ -62,40 +105,6 @@ static int32_t write_all(int fd, const char *buf, size_t n) {
     return 0;
 }
 
-static int32_t one_request(int connfd) {
-    // 4-byte header
-    char rbuf[4 + K_MAX_MSG];
-    errno = 0;
-    int32_t err = read_full(connfd, rbuf, 4);
-    if(err) {
-        msg(errno == 0 ? "EOF" : "read() error");
-        return err;
-    }
-
-    uint32_t len = 0;
-    memcpy(&len, rbuf, 4); // rbuf의 처음 4바이트를 len에 복사
-    if(len > K_MAX_MSG) {
-        msg("too long");
-        return -1;
-    }
-
-    // request body
-    err = read_full(connfd, &rbuf[4], len);
-    if(err) {
-        msg("read() error");
-        return err;
-    }
-    printf("client says: %.*s\n", len, &rbuf[4]);
-
-    // reply
-    const char reply[] = "world";
-    char wbuf[4 + sizeof(reply)];
-    len = (uint32_t)strlen(reply);
-    memcpy(wbuf, &len, 4);
-    memcpy(&wbuf[4], reply, len);
-    return write_all(connfd, wbuf, 4 + len);
-}
-
 static void fd_set_nb(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 }
@@ -107,6 +116,13 @@ static Conn *handle_accept(int fd) { // fd: server's listen socket
     int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
     if(connfd < 0)
         return NULL;
+
+    uint32_t ip = client_addr.sin_addr.s_addr;
+    fprintf(stderr, "new client from %u.%u.%u.%u:%u\n",
+        ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+        ntohs(client_addr.sin_port)
+    );
+
     // Set new connection to non-bloking mode
     fd_set_nb(connfd);
 
@@ -116,33 +132,20 @@ static Conn *handle_accept(int fd) { // fd: server's listen socket
     return conn;
 }
 
-static void handle_read(Conn *conn) {
-    // Do a non-blocking read
-    uint8_t buf[64 * 1024];
-    ssize_t rv = read(conn->fd, buf, sizeof(buf));
-    if(rv <= 0) { // IO error (rv < 0) or EOF (rv == 0)
-        conn->want_close = true;
-        return;
-    }
-    // Add new data to the incoming buffer
-    buf_append(conn->incoming, buf, (size_t)rv);
-    try_one_request(conn);
-    // Update the readiness intention
-    if(conn->outgoing.size() > 0 ) { // has a response
-        conn->want_read = false;
-        conn->want_write = true;
-    } // else: wand read
-}
-
 static void handle_write(Conn *conn) {
     assert(conn->outgoing.size() > 0);
     ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if(rv < 0 && errno == EAGAIN) {
+        return; // client not ready (send buffer is full)
+    }
     if(rv < 0) {
         conn->want_close = true;
         return;
     }
+
     // Remove written data from outgoing
     buf_consume(conn->outgoing, (size_t)rv);
+
     // Update the readiness intention
     if(conn->outgoing.size() == 0) { // all data written
         conn->want_read = true;
@@ -150,40 +153,31 @@ static void handle_write(Conn *conn) {
     } // else: want write
 }
 
-// Request if there is enough data
-static bool try_one_request(Conn *conn) {
-    // Try to parse the accumulated buffer
-    if(conn->incoming.size() < 4) {
-        return false; // want read more
+static void handle_read(Conn *conn) {
+    // Do a non-blocking read
+    uint8_t buf[64 * 1024];
+    ssize_t rv = read(conn->fd, buf, sizeof(buf));
+    
+    if(rv < 0 && errno == EAGAIN) {
+        return; // not ready (receive buffer is empty)
     }
-    // Protocol: message header
-    uint32_t len = 0;
-    memcpy(&len, conn->incoming.data(), 4);
-    if(len > K_MAX_MSG) {
+    if(rv <= 0) { // IO error (rv < 0) or EOF (rv == 0)
         conn->want_close = true;
-        return false; // want close
+        return;
     }
-    // Protocol: message body
-    if(4 + len > conn->incoming.size()) {
-        return false; // want read more
-    }
-    const uint8_t *request = &conn->incoming[4];
-    // Process the parsed message
-    // ...
-    // Generate the response (echo)
-    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
-    buf_append(conn->outgoing, request, len);
-    // Remove the message from incoming
-    buf_consume(conn->incoming, 4 + len);
-    return true;
-}
 
-static void buf_append(vector<uint8_t> &buf, const uint8_t *data, size_t len) {
-    buf.insert(buf.end(), data, data + len);
-}
+    // Add new data to the incoming buffer
+    buf_append(conn->incoming, buf, (size_t)rv);
 
-static void buf_consume(vector<uint8_t> &buf, size_t n) {
-    buf.erase(buf.begin(), buf.begin() + n);
+    // Parse requests and generate responses
+    while(try_one_request(conn)) {}
+
+    // Update the readiness intention
+    if(conn->outgoing.size() > 0 ) { // has a response
+        conn->want_read = false;
+        conn->want_write = true;
+        return handle_write(conn); // optimization
+    } // else: wand read
 }
 
 int main() {
@@ -216,6 +210,7 @@ int main() {
 
     vector<Conn *> fd2conn; // Map of all client connections, index = fd
     vector<struct pollfd> poll_args; // Event loop
+
     while (true) {
         // Construct the fd list for poll()
         poll_args.clear(); // reset
@@ -226,16 +221,18 @@ int main() {
             if(!conn) {
                 continue;
             }
-            pfd = {conn->fd, POLLERR, 0};
-            if(conn->want_read) pfd.events |= POLLIN;
-            if(conn->want_write) pfd.events |= POLLOUT;
+            struct pollfd pfd = {conn->fd, POLLERR, 0};
+            if(conn->want_read) 
+                pfd.events |= POLLIN;
+            if(conn->want_write) 
+                pfd.events |= POLLOUT;
             poll_args.push_back(pfd);
         }
 
         // Call poll()
         rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
         if(rv < 0 && errno == EINTR) {
-            continue; // not an error
+            continue; // not an error (interrupt)
         }
         if(rv < 0) {
             die("poll()");
